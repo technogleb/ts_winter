@@ -267,3 +267,68 @@ class TimeSeriesPredictor(BaseEstimator):
         df = self.enrich(df)
 
         return df
+
+
+class TimeSeriesDetector(TimeSeriesPredictor):
+    def __init__(
+            self, sigma=2.7, bootstrapping=False, bootstrapping_quantile=0.97, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sigma = sigma
+        self.bootstrapping = bootstrapping
+        self.bootstrapping_quantile = bootstrapping_quantile
+
+    def fit_statistics(self, ts):
+        preds = self.predict_batch(ts)
+        residuals = ts - preds
+        if self.bootstrapping:
+            samples_statistics = []
+            for i in range(100):
+                sample = resample(residuals, n_samples=len(residuals))
+                sample.dropna(inplace=True)
+                statistic = np.quantile(sample, self.bootstrapping_quantile)
+                samples_statistics.append(statistic)
+
+            statistic_estimate = sum(samples_statistics) / len(samples_statistics)
+            self.std = statistic_estimate
+        else:
+            std = residuals.std()
+            self.std = std
+
+    def get_prediction_intervals(self, y_pred, season=False):
+        if season:
+            std_series = pd.Series(
+                map(lambda x: self.std.get(x.hour), y_pred.index), index=y_pred.index
+            )
+            lower, upper = y_pred - self.sigma * std_series, y_pred + self.sigma * std_series
+        elif self.bootstrapping:
+            lower, upper = y_pred - self.std, y_pred + self.std
+        else:
+            lower, upper = y_pred - self.sigma * self.std, y_pred + self.sigma * self.std
+        return lower, upper
+
+    def detect(self, ts_true, ts_pred, season=False):
+        lower, upper = self.get_prediction_intervals(ts_pred, season=season)
+        return ts_true[(ts_true < lower) | (ts_true > upper)]
+
+    def fit_seasonal_statistics(self, ts_train, n_splits=3, period=24):
+        def split(period, n_splits):
+            avg = period // n_splits
+            seq = range(period)
+            out = []
+            last = 0.0
+
+            while last < len(seq):
+                out.append(tuple(seq[int(last):int(last + avg)]))
+                last += avg
+
+            return out
+
+        ranges = split(period, n_splits)
+
+        seasonal_std = {}
+        for range_ in ranges:
+            range_std = ts_train[ts_train.index.map(lambda x: x.hour in range_)].std()
+            for i in range_:
+                seasonal_std[i] = range_std
+
+        self.std = seasonal_std
